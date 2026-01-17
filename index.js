@@ -43,7 +43,7 @@ const PORT = 3000;
 
 // Telegram
 const TELEGRAM_TOKEN = '8447340973:AAG2DVWC0KnsBlOkhRFVncXvmJo3N0LOIns';
-const TELEGRAM_CHAT_ID = 'ME';
+const TELEGRAM_CHAT_ID = '8288411595';
 let lastTelegramAlert = 0;
 
 function sendTelegramAlert(text) {
