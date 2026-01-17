@@ -1,157 +1,177 @@
-import { createClient } from 'bedrock-protocol'
-import fs from 'fs'
-import path from 'path'
-import https from 'https'
+import http from "http";
+import fs from "fs";
+import { createClient } from "bedrock-protocol";
 
-// ---- CONFIG ----
-const HOST = 'play.sigmapallukka.xyz'
-const PORT = 20465
-const EMAIL = 'tissimattolou@outlook.com'
-const VERSION = false
+// ===== FLY KEEPALIVE =====
+const WEB_PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("alive\n");
+}).listen(WEB_PORT, () => {
+  console.log("[WEB] keepalive server on", WEB_PORT);
+});
 
-// Telegram
-const TG_TOKEN = '8447340973:AAG2DVWC0KnsBlOkhRFVncXvmJo3N0LOIns'
-const TG_CHAT = null // botin eka viesti kertoo chat id:n jos tää on null
+// ===== CONFIG =====
+const HOST = "play.sigmapallukka.xyz";
+const PORT = 20465;
+const EMAIL = "tissimattolou@outlook.com";
+const AUTH_DIR = "/data/mc"; // Fly volume
 
-// Persistent auth dir (Fly volume -> /data)
-const AUTH_DIR = '/data/mc'
+if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
-// ---- STATE ----
-let client = null
-let lastTelegram = 0
-let reconnectTimer = null
-let pingTimer = null
+// ===== STATE =====
+let client = null;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let afkTimer = null;
+let slowTimer = null;
 
-// ---- HELPERS ----
+// ===== UTILS =====
 function log(...a) {
-  console.log(new Date().toISOString(), ...a)
+  console.log(new Date().toISOString(), ...a);
 }
-
-function ensureDir(p) {
-  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true })
-}
-
-function sendTelegram(text) {
-  const now = Date.now()
-  if (now - lastTelegram < 60 * 60 * 1000) return // kerran tunnissa
-  lastTelegram = now
-
-  const msg = encodeURIComponent(text)
-  const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage?chat_id=${TG_CHAT || '@MineServerStatus'}&text=${msg}`
-
-  https.get(url).on('error', () => {})
-}
-
-let reconnectTimer = null
 
 function scheduleReconnect() {
-  if (reconnectTimer) return
+  if (reconnectTimer) return;
 
-  const delay = Math.min(60_000 * (reconnectAttempts + 1), 5 * 60_000)
-  reconnectAttempts++
+  const delay = Math.min(60_000 * (reconnectAttempts + 1), 5 * 60_000);
+  reconnectAttempts++;
 
-  console.log(`[RECONNECT] Retrying in ${Math.round(delay / 1000)}s`)
+  log(`[RECONNECT] retry in ${Math.round(delay / 1000)}s`);
   reconnectTimer = setTimeout(() => {
-    reconnectTimer = null
-    startBot()
-  }, delay)
+    reconnectTimer = null;
+    startBot();
+  }, delay);
 }
 
-function startPingLoop() {
-  if (pingTimer) return
-  pingTimer = setInterval(() => {
-    if (client) return
-    log('[PING] server unreachable')
-    sendTelegram('Vittu servus taas räjähtäny 💔')
-    startBot()
-  }, 49_000)
-}
-
-// ---- BOT ----
-function startBot() {
-  ensureDir(AUTH_DIR)
-
+function cleanup() {
+  if (afkTimer) clearInterval(afkTimer);
+  if (slowTimer) clearInterval(slowTimer);
+  afkTimer = null;
+  slowTimer = null;
   if (client) {
-    try { client.close() } catch {}
-    client = null
+    try { client.close(); } catch {}
   }
+  client = null;
+}
 
-  log('[BOT] starting…')
+// ===== BOT =====
+function startBot() {
+  cleanup();
+
+  log("[BOT] starting…");
 
   try {
     client = createClient({
       host: HOST,
       port: PORT,
       username: EMAIL,
-      auth: 'microsoft',
+      auth: "microsoft",
       profilesFolder: AUTH_DIR,
-      version: VERSION
-    })
+      version: false
+    });
 
-    client.on('connect', () => {
-      log('[NET] socket connected')
-    })
+    client.on("connect", () => {
+      log("[NET] socket connected");
+    });
 
-    client.on('join', () => {
-      log('[OK] joined server')
-    })
+    client.on("join", () => {
+      log("[OK] joined server");
+      reconnectAttempts = 0;
+    });
 
-    client.on('spawn', () => {
-      log('[OK] spawned')
-      startAFK()
-    })
+    client.on("spawn", () => {
+      log("[OK] spawned");
+      startAFK();
+    });
 
-    client.on('disconnect', (p) => {
-      log('[DISCONNECT]', p?.message || '')
-      client = null
-      scheduleReconnect(15_000)
-    })
+    client.on("disconnect", (p) => {
+      log("[DISCONNECT]", p?.message || "");
+      cleanup();
+      scheduleReconnect();
+    });
 
-    client.on('close', () => {
-      log('[CLOSE]')
-      client = null
-      scheduleReconnect(15_000)
-    })
+    client.on("close", () => {
+      log("[CLOSE]");
+      cleanup();
+      scheduleReconnect();
+    });
 
-    client.on('error', (e) => {
-      log('[ERROR]', e.message)
-      if (String(e.message).includes('token') || String(e.message).includes('auth')) {
-        log('[AUTH] token invalid -> reauth needed')
-        sendTelegram('Microsoft-token hajosi, vaatii uuden loginin')
-      }
-    })
+    client.on("error", (e) => {
+      log("[ERROR]", e.message);
+      cleanup();
+      scheduleReconnect();
+    });
+
   } catch (e) {
-    log('[FATAL]', e.message)
-    client = null
-    scheduleReconnect(30_000)
+    log("[FATAL]", e.message);
+    cleanup();
+    scheduleReconnect();
   }
 }
 
 function startAFK() {
-  setInterval(() => {
-    if (!client || !client.entityId) return
+  // pieni liike
+  afkTimer = setInterval(() => {
+    if (!client || !client.entityId) return;
     try {
-      client.queue('player_action', {
+      client.queue("move_player", {
         runtime_id: client.entityId,
-        action: 'start_sneak',
+        position: { x: 0, y: 0, z: 0 },
+        pitch: 0,
+        yaw: 0,
+        head_yaw: 0,
+        mode: "normal",
+        on_ground: true,
+        riding_eid: 0n,
+        tick: BigInt(Date.now())
+      });
+    } catch {}
+  }, 45_000);
+
+  // 26 min välein crouch + askel taakse
+  slowTimer = setInterval(() => {
+    if (!client || !client.entityId) return;
+    try {
+      client.queue("player_action", {
+        runtime_id: client.entityId,
+        action: "start_sneak",
         position: { x: 0, y: 0, z: 0 },
         face: 0
-      })
+      });
       setTimeout(() => {
-        client.queue('player_action', {
-          runtime_id: client.entityId,
-          action: 'stop_sneak',
-          position: { x: 0, y: 0, z: 0 },
-          face: 0
-        })
-      }, 300)
+        try {
+          client.queue("player_action", {
+            runtime_id: client.entityId,
+            action: "stop_sneak",
+            position: { x: 0, y: 0, z: 0 },
+            face: 0
+          });
+          client.queue("move_player", {
+            runtime_id: client.entityId,
+            position: { x: 0, y: 0, z: -0.6 },
+            pitch: 0,
+            yaw: 0,
+            head_yaw: 0,
+            mode: "normal",
+            on_ground: true,
+            riding_eid: 0n,
+            tick: BigInt(Date.now())
+          });
+        } catch {}
+      }, 300);
     } catch {}
-  }, 26 * 60 * 1000)
+  }, 26 * 60 * 1000);
 }
 
-// ---- BOOT ----
-startPingLoop()
-startBot()
+// ===== BOOT =====
+log("[STARTUP] process alive");
+startBot();
 
-process.on('SIGINT', () => process.exit(0))
-process.on('SIGTERM', () => process.exit(0))
+process.on("uncaughtException", err => {
+  console.error("[FATAL]", err);
+});
+
+process.on("unhandledRejection", err => {
+  console.error("[PROMISE]", err);
+});
