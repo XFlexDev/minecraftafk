@@ -68,7 +68,7 @@ function startBot() {
       username: EMAIL,
       auth: "microsoft",
       profilesFolder: AUTH_DIR,
-      version: false
+      version: '1.21.130': 898,
     });
 
     client.on("connect", () => {
