@@ -1,231 +1,81 @@
+import { createClient, ping } from 'bedrock-protocol'
+import dotenv from 'dotenv'
+import fs from 'fs'
+import path from 'path'
+import express from 'express'
+import { createServer } from 'http'
+import { Server } from 'socket.io'
 
-import { createClient } from 'bedrock-protocol';
-import express from 'express';
-import { createServer } from 'http';
-import { Server } from 'socket.io';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-import fs from 'fs';
-import dgram from 'dgram';
-import https from 'https';
+dotenv.config()
 
-// ==== KEEP PROCESS ALIVE ====
-process.on('uncaughtException', err => console.error('[FATAL]', err));
-process.on('unhandledRejection', err => console.error('[PROMISE]', err));
-setInterval(() => {}, 60000); // heartbeat
-
-// Persistent auth across restarts
-fs.mkdirSync('/data/auth', { recursive: true });
-process.env.PRISMARINE_AUTH_DIR = '/data/auth';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-// Web
-const app = express();
-const httpServer = createServer(app);
-const io = new Server(httpServer);
-
-app.set('view engine', 'ejs');
-app.set('views', join(__dirname, 'views'));
-app.use(express.static(join(__dirname, 'public')));
-app.use(express.json());
-
-// BOT CONFIG (HARDCODED)
 const BOT_CONFIG = {
   host: 'play.sigmapallukka.xyz',
   port: 20465,
-  username: 'tissimattolou@outlook.com',
-  offline: false
-};
-
-const PORT = 3000;
-
-// Telegram
-const TELEGRAM_TOKEN = '8447340973:AAG2DVWC0KnsBlOkhRFVncXvmJo3N0LOIns';
-const TELEGRAM_CHAT_ID = '8288411595';
-let lastTelegramAlert = 0;
-
-function sendTelegramAlert(text) {
-  const now = Date.now();
-  if (now - lastTelegramAlert < 3600000) return;
-  lastTelegramAlert = now;
-
-  const data = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text });
-  const req = https.request({
-    hostname: 'api.telegram.org',
-    path: `/bot${TELEGRAM_TOKEN}/sendMessage`,
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(data)
-    }
-  });
-  req.on('error', () => {});
-  req.write(data);
-  req.end();
+  username: 'BedrockBot',
+  auth: 'microsoft',
+  profilesFolder: './auth',
+  version: 'latest'
 }
 
-let client = null;
-let serverOnline = false;
+const TELEGRAM_TOKEN = '8447340973:AAG2DVWC0KnsBlOkhRFVncXvmJo3N0LOIns'
+const TELEGRAM_CHAT = '8447340973'
+const PORT = process.env.PORT || 3000
 
-let botStats = {
-  status: 'Disconnected',
+if (!fs.existsSync('./auth')) fs.mkdirSync('./auth', { recursive: true })
+
+const app = express()
+const server = createServer(app)
+const io = new Server(server)
+
+let client = null
+let serverAlive = false
+let lastTelegram = 0
+let movementTimer = null
+
+let stats = {
+  status: 'Idle',
   uptime: 0,
+  reconnects: 0,
   memory: 0,
   lastUpdate: Date.now()
-};
-
-app.get('/', (req, res) => {
-  res.send('<h1>AFK Bot running</h1>');
-});
-
-io.on('connection', socket => {
-  socket.emit('stats', botStats);
-});
+}
 
 function updateStats() {
-  const u = process.memoryUsage();
-  botStats.memory = (u.heapUsed / 1024 / 1024).toFixed(2);
-  botStats.lastUpdate = Date.now();
-  io.emit('stats', botStats);
+  const mem = process.memoryUsage()
+  stats.memory = (mem.heapUsed / 1024 / 1024).toFixed(2)
+  stats.lastUpdate = Date.now()
+  io.emit('stats', stats)
 }
-setInterval(updateStats, 1000);
+setInterval(updateStats, 1000)
 
-// ==== PING WATCHDOG ====
-function pingBedrock(host, port, timeout = 3000) {
-  return new Promise(resolve => {
-    const s = dgram.createSocket('udp4');
-    const buf = Buffer.from([0x01]);
-    const t = setTimeout(() => {
-      s.close();
-      resolve(false);
-    }, timeout);
-
-    s.send(buf, 0, buf.length, port, host, () => {});
-    s.on('message', () => {
-      clearTimeout(t);
-      s.close();
-      resolve(true);
-    });
-    s.on('error', () => {
-      clearTimeout(t);
-      s.close();
-      resolve(false);
-    });
-  });
-}
-
-async function watchdog() {
-  const alive = await pingBedrock(BOT_CONFIG.host, BOT_CONFIG.port);
-
-  if (!alive) {
-    if (serverOnline) {
-      serverOnline = false;
-      if (client) client.close();
-      client = null;
-    }
-    sendTelegramAlert('Vittu servus taas räjähtäny 💔');
-    return;
-  }
-
-  if (alive && !client) {
-    serverOnline = true;
-    createBedrockBot();
-  }
-}
-
-setInterval(watchdog, 49000);
-
-// ==== BOT CORE ====
-function createBedrockBot() {
-  console.log('[BEDROCK] Connecting...');
-  botStats.status = 'Connecting...';
-  updateStats();
+async function sendTelegram(msg) {
+  const now = Date.now()
+  if (now - lastTelegram < 60 * 60 * 1000) return
+  lastTelegram = now
 
   try {
-    client = createClient(BOT_CONFIG);
-
-    client.on('join', () => {
-      botStats.status = 'Connected';
-      botStats.uptime = Date.now();
-      updateStats();
-      startAFKMovement();
-      startSlowNudge();
-    });
-
-    client.on('spawn', () => {
-      botStats.status = 'In-Game';
-      updateStats();
-    });
-
-    client.on('error', err => {
-      botStats.status = 'Error';
-      updateStats();
-      console.error('[ERROR]', err);
-    });
-
-    client.on('disconnect', () => {
-      botStats.status = 'Disconnected';
-      updateStats();
-      client = null;
-    });
-
-    client.on('close', () => {
-      botStats.status = 'Disconnected';
-      updateStats();
-      client = null;
-    });
-
-  } catch (err) {
-    console.error('[FATAL]', err);
-    botStats.status = 'Fatal Error';
-    updateStats();
-  }
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT,
+        text: msg
+      })
+    })
+  } catch {}
 }
 
-// Small AFK jitter
-function startAFKMovement() {
-  let moveInterval = setInterval(() => {
-    if (!client || !client.entityId) return;
-    try {
-      client.queue('move_player', {
-        runtime_id: client.entityId,
-        position: {
-          x: (Math.random() - 0.5) * 2,
-          y: 0,
-          z: (Math.random() - 0.5) * 2
-        },
-        pitch: Math.random() * 20 - 10,
-        yaw: Math.random() * 360,
-        head_yaw: Math.random() * 360,
-        mode: 'normal',
-        on_ground: true,
-        riding_eid: 0n,
-        tick: BigInt(Date.now())
-      });
-    } catch {}
-  }, Math.random() * 15000 + 45000);
-
-  if (client) {
-    client.once('close', () => {
-      if (moveInterval) clearInterval(moveInterval);
-    });
-  }
-}
-
-// Every 26 minutes: crouch + step back
-function startSlowNudge() {
-  const NUDGE_MS = 26 * 60 * 1000;
-  setInterval(() => {
-    if (!client || !client.entityId) return;
+function startMovement() {
+  stopMovement()
+  movementTimer = setInterval(() => {
+    if (!client || !client.entityId) return
     try {
       client.queue('player_action', {
         runtime_id: client.entityId,
         action: 'start_sneak',
         position: { x: 0, y: 0, z: 0 },
         face: 0
-      });
+      })
       setTimeout(() => {
         try {
           client.queue('player_action', {
@@ -233,32 +83,71 @@ function startSlowNudge() {
             action: 'stop_sneak',
             position: { x: 0, y: 0, z: 0 },
             face: 0
-          });
-          client.queue('move_player', {
-            runtime_id: client.entityId,
-            position: { x: 0, y: 0, z: -0.6 },
-            pitch: 0,
-            yaw: 0,
-            head_yaw: 0,
-            mode: 'normal',
-            on_ground: true,
-            riding_eid: 0n,
-            tick: BigInt(Date.now())
-          });
+          })
         } catch {}
-      }, 400);
+      }, 200)
     } catch {}
-  }, NUDGE_MS);
+  }, 26 * 60 * 1000)
 }
 
-// ==== START ====
-httpServer.listen(PORT, () => {
-  console.log('[STARTUP] Bot starting up...');
-  watchdog();
-});
+function stopMovement() {
+  if (movementTimer) clearInterval(movementTimer)
+  movementTimer = null
+}
 
-process.on('SIGINT', () => {
-  if (client) client.close();
-  httpServer.close();
-  process.exit(0);
-});
+function createBot() {
+  if (client || !serverAlive) return
+
+  try {
+    stats.status = 'Joining'
+    client = createClient(BOT_CONFIG)
+
+    client.on('join', () => {
+      stats.status = 'Online'
+      stats.uptime = Date.now()
+      startMovement()
+    })
+
+    client.on('spawn', () => {
+      stats.status = 'In-Game'
+    })
+
+    const cleanup = () => {
+      stopMovement()
+      client = null
+      stats.status = 'Disconnected'
+    }
+
+    client.on('close', cleanup)
+    client.on('disconnect', cleanup)
+    client.on('error', cleanup)
+  } catch {
+    client = null
+  }
+}
+
+async function watchdog() {
+  try {
+    await ping({ host: BOT_CONFIG.host, port: BOT_CONFIG.port })
+    if (!serverAlive) {
+      serverAlive = true
+      createBot()
+    }
+  } catch {
+    if (serverAlive) {
+      serverAlive = false
+      if (client) {
+        try { client.close() } catch {}
+        client = null
+      }
+      await sendTelegram('Vittu servus taas räjähtäny 💔')
+    }
+  }
+}
+
+setInterval(watchdog, 49000)
+
+server.listen(PORT, () => {
+  console.log('Watchdog online')
+  watchdog()
+})
