@@ -7,7 +7,7 @@ import https from 'https'
 const HOST = 'play.sigmapallukka.xyz'
 const PORT = 20465
 const EMAIL = 'tissimattolou@outlook.com'
-const VERSION = '1.21.111'
+const VERSION = false
 
 // Telegram
 const TG_TOKEN = '8447340973:AAG2DVWC0KnsBlOkhRFVncXvmJo3N0LOIns'
@@ -42,12 +42,19 @@ function sendTelegram(text) {
   https.get(url).on('error', () => {})
 }
 
-function scheduleReconnect(ms) {
+let reconnectTimer = null
+
+function scheduleReconnect() {
   if (reconnectTimer) return
+
+  const delay = Math.min(60_000 * (reconnectAttempts + 1), 5 * 60_000)
+  reconnectAttempts++
+
+  console.log(`[RECONNECT] Retrying in ${Math.round(delay / 1000)}s`)
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null
     startBot()
-  }, ms)
+  }, delay)
 }
 
 function startPingLoop() {
